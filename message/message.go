@@ -25,6 +25,8 @@ const (
 
 	CBlockInfo MessageType = "BlockInfo"
 	CSeqIDinfo MessageType = "SequenceID"
+	CProposal  MessageType = "proposal"
+	CAccept    MessageType = "accept"
 )
 
 var (

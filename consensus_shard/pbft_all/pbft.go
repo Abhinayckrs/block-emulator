@@ -11,6 +11,7 @@ import (
 	"blockEmulator/params"
 	"blockEmulator/shard"
 	"bufio"
+	"encoding/json"
 	"io"
 	"log"
 	"net"
@@ -158,6 +159,9 @@ func NewPbftNode(shardID, nodeID uint64, pcc *params.ChainConfig, messageHandleT
 		p.ohm = &RawBrokerOutsideModule{
 			pbftNode: p,
 		}
+	case "SLC":
+		p.ihm = &RawSLCPbftExtraHandleMod{pbftNode: p}
+		p.ohm = &RawRelayOutsideModule{pbftNode: p}
 	default:
 		p.ihm = &RawRelayPbftExtraHandleMod{
 			pbftNode: p,
@@ -194,6 +198,10 @@ func (p *PbftConsensusNode) handleMessage(msg []byte) {
 	case message.NewChange:
 		p.handleNewViewMsg(content)
 
+	case message.CProposal:
+		go p.handleProposal(content)
+	case message.CAccept:
+		go p.handleAccept(content)
 	case message.CRequestOldrequest:
 		p.handleRequestOldSeq(content)
 	case message.CSendOldrequest:
@@ -261,4 +269,108 @@ func (p *PbftConsensusNode) WaitToStop() {
 // close the pbft
 func (p *PbftConsensusNode) closePbft() {
 	p.CurChain.CloseBlockChain()
+}
+
+// New Methods for SLC
+func (p *PbftConsensusNode) handleProposal(content []byte) {
+	ppmsg := new(message.PrePrepare) // Reuse PrePrepare struct for simplicity
+	err := json.Unmarshal(content, ppmsg)
+	if err != nil {
+		log.Panic(err)
+	}
+	p.pbftLock.Lock()
+	defer p.pbftLock.Unlock()
+	for p.pbftStage.Load() < 1 && ppmsg.SeqID >= p.sequenceID {
+		p.conditionalVarpbftLock.Wait()
+	}
+	defer p.conditionalVarpbftLock.Broadcast()
+
+	if ppmsg.SeqID < p.sequenceID {
+		return
+	}
+
+	flag := false
+	if digest := getDigest(ppmsg.RequestMsg); string(digest) != string(ppmsg.Digest) {
+		p.pl.Plog.Printf("S%dN%d: digest mismatch\n", p.ShardID, p.NodeID)
+	} else {
+		flag = p.ihm.HandleinPrePrepare(ppmsg)
+		p.requestPool[string(ppmsg.Digest)] = ppmsg.RequestMsg
+		p.height2Digest[ppmsg.SeqID] = string(ppmsg.Digest)
+	}
+
+	if flag {
+		accept := message.Commit{ // Reuse Commit struct for CAccept
+			Digest:     ppmsg.Digest,
+			SeqID:      ppmsg.SeqID,
+			SenderNode: p.RunningNode,
+		}
+		acceptByte, err := json.Marshal(accept)
+		if err != nil {
+			log.Panic()
+		}
+		msg_send := message.MergeMessage(message.CAccept, acceptByte)
+		networks.Broadcast(p.RunningNode.IPaddr, p.getNeighborNodes(), msg_send)
+		networks.TcpDial(msg_send, p.RunningNode.IPaddr)
+		p.pl.Plog.Printf("S%dN%d: broadcasted accept message\n", p.ShardID, p.NodeID)
+		p.pbftStage.Add(1)
+	}
+}
+
+func (p *PbftConsensusNode) handleAccept(content []byte) {
+	cmsg := new(message.Commit)
+	err := json.Unmarshal(content, cmsg)
+	if err != nil {
+		log.Panic(err)
+	}
+	p.pbftLock.Lock()
+	defer p.pbftLock.Unlock()
+	for p.pbftStage.Load() < 2 && cmsg.SeqID >= p.sequenceID {
+		p.conditionalVarpbftLock.Wait()
+	}
+	defer p.conditionalVarpbftLock.Broadcast()
+
+	if cmsg.SeqID < p.sequenceID {
+		return
+	}
+
+	p.pl.Plog.Printf("S%dN%d received Accept from N%d\n", p.ShardID, p.NodeID, cmsg.SenderNode.NodeID)
+	p.set2DMap(false, string(cmsg.Digest), cmsg.SenderNode)
+	cnt := len(p.cntCommitConfirm[string(cmsg.Digest)])
+
+	p.lock.Lock()
+	defer p.lock.Unlock()
+
+	if uint64(cnt) >= 2*p.malicious_nums+1 && !p.isReply[string(cmsg.Digest)] {
+		p.pl.Plog.Printf("S%dN%d: received 2f+1 accepts\n", p.ShardID, p.NodeID)
+		if _, ok := p.requestPool[string(cmsg.Digest)]; !ok {
+			p.isReply[string(cmsg.Digest)] = true
+			p.askForLock.Lock()
+			sn := &shard.Node{
+				NodeID:  0, // Static leader
+				ShardID: p.ShardID,
+				IPaddr:  p.ip_nodeTable[p.ShardID][0],
+			}
+			orequest := message.RequestOldMessage{
+				SeqStartHeight: p.sequenceID + 1,
+				SeqEndHeight:   cmsg.SeqID,
+				ServerNode:     sn,
+				SenderNode:     p.RunningNode,
+			}
+			bromyte, err := json.Marshal(orequest)
+			if err != nil {
+				log.Panic()
+			}
+			msg_send := message.MergeMessage(message.CRequestOldrequest, bromyte)
+			networks.TcpDial(msg_send, orequest.ServerNode.IPaddr)
+		} else {
+			p.ihm.HandleinCommit(cmsg)
+			p.isReply[string(cmsg.Digest)] = true
+			p.pl.Plog.Printf("S%dN%d: SLC round %d ended\n", p.ShardID, p.NodeID, p.sequenceID)
+			p.sequenceID += 1
+			p.pbftStage.Store(1)
+			if p.NodeID == 0 {
+				p.sequenceLock.Unlock()
+			}
+		}
+	}
 }
